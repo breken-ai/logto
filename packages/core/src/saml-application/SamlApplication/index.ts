@@ -37,6 +37,7 @@ import assertThat from '#src/utils/assert-that.js';
 
 import {
   samlLogInResponseTemplate,
+  samlErrorResponseTemplate,
   samlAttributeNameFormatBasic,
   samlValueXmlnsXsi,
   fallbackAttributes,
@@ -138,6 +139,7 @@ export class SamlApplication {
   protected oidcConfig?: CamelCaseKeys<OidcConfigResponse>;
 
   private _idp?: saml.IdentityProviderInstance;
+  private _errorIdp?: saml.IdentityProviderInstance;
   private _sp?: saml.ServiceProviderInstance;
 
   constructor(
@@ -154,6 +156,17 @@ export class SamlApplication {
     this._idp ||= this.buildSamlIdentityProvider();
     this.setSchemaValidator();
     return this._idp;
+  }
+
+  /**
+   * Error status responses carry no assertion, so they must never be assertion-encrypted
+   * (samlify would look for an `Assertion` element that is not there). A dedicated IdP
+   * instance keeps assertion encryption scoped to success responses.
+   */
+  public get errorIdp(): saml.IdentityProviderInstance {
+    this._errorIdp ||= this.buildSamlIdentityProvider(false);
+    this.setSchemaValidator();
+    return this._errorIdp;
   }
 
   public get sp(): saml.ServiceProviderInstance {
@@ -226,6 +239,52 @@ export class SamlApplication {
     };
   };
 
+  /**
+   * Build a SAML error status response (no assertion) for the service provider, e.g.
+   * `NoPassive` for an unsatisfiable `IsPassive` request or `UnknownPrincipal` for a `Subject`
+   * mismatch. The response is POSTed to the assertion consumer service URL like a success
+   * response, so the service provider learns the outcome through the protocol instead of the
+   * user landing on a Logto error page.
+   *
+   * @param statusCode Second-level status code URI (under top-level `Responder`).
+   */
+  public createSamlErrorResponse = async ({
+    statusCode,
+    relayState,
+    samlRequestId,
+  }: {
+    statusCode: string;
+    relayState: Nullable<string>;
+    samlRequestId: Nullable<string>;
+  }): Promise<{
+    context: string;
+    entityEndpoint: string;
+    relayState?: string;
+  }> => {
+    const optionalRelayState = conditional(relayState);
+    const loginResponse = await this.errorIdp.createLoginResponse(
+      this.sp,
+      // @ts-expect-error --fix request object later
+      null,
+      'post',
+      {},
+      this.createSamlErrorTemplateCallback({ statusCode, samlRequestId }),
+      false,
+      optionalRelayState
+    );
+
+    assertThat(
+      'entityEndpoint' in loginResponse,
+      new Error('Expected a POST binding context from `createLoginResponse`.')
+    );
+
+    return {
+      context: loginResponse.context,
+      entityEndpoint: loginResponse.entityEndpoint,
+      relayState: optionalRelayState,
+    };
+  };
+
   // Helper functions for SAML callback
   public handleOidcCallbackAndGetUserInfo = async ({ code }: { code: string }) => {
     // Exchange authorization code for tokens
@@ -239,15 +298,48 @@ export class SamlApplication {
     return this.getUserInfo({ accessToken });
   };
 
-  public getSignInUrl = async ({ state }: { state?: string }) => {
+  /**
+   * Build the OIDC authorization URL that signs the user in for this SAML application.
+   *
+   * `prompt=login` is only added when the service provider asked for re-authentication with
+   * `ForceAuthn="true"` on its `AuthnRequest` (SAML 2.0 core, section 3.4.1). Otherwise an
+   * existing Logto session is reused, as it is for OIDC applications.
+   */
+  public getSignInUrl = async ({
+    state,
+    forceAuthn,
+    isPassive,
+  }: {
+    state?: string;
+    forceAuthn?: boolean;
+    isPassive?: boolean;
+  }) => {
     const { authorizationEndpoint } = await this.fetchOidcConfig();
+
+    // `IsPassive` and `ForceAuthn` contradict each other; a request carrying both is
+    // malformed (SAML 2.0 core, section 3.4.1).
+    assertThat(
+      !(forceAuthn && isPassive),
+      new RequestError({
+        code: 'application.saml.invalid_saml_request',
+        message: '`ForceAuthn` and `IsPassive` must not be combined on the same authentication request.',
+      })
+    );
 
     const queryParameters = new URLSearchParams({
       [QueryKey.ClientId]: this.samlApplicationId,
       [QueryKey.RedirectUri]: this.config.redirectUri,
       [QueryKey.ResponseType]: 'code',
-      [QueryKey.Prompt]: Prompt.Login,
     });
+
+    if (forceAuthn) {
+      queryParameters.append(QueryKey.Prompt, Prompt.Login);
+    } else if (isPassive) {
+      // `IsPassive="true"` means the identity provider must not take visible control of the
+      // user interface; `prompt=none` is the OIDC equivalent. If no session exists, the
+      // callback translates the resulting `login_required` into a `NoPassive` status response.
+      queryParameters.append(QueryKey.Prompt, Prompt.None);
+    }
 
     queryParameters.append(
       QueryKey.Scope,
@@ -262,7 +354,9 @@ export class SamlApplication {
     return new URL(`${authorizationEndpoint}?${queryParameters.toString()}`);
   };
 
-  protected buildSamlIdentityProvider = (): saml.IdentityProviderInstance => {
+  protected buildSamlIdentityProvider = (
+    encryptAssertion?: boolean
+  ): saml.IdentityProviderInstance => {
     const {
       entityId,
       certificate,
@@ -286,7 +380,7 @@ export class SamlApplication {
         },
       ],
       privateKey,
-      isAssertionEncrypted: encryptSamlAssertion,
+      isAssertionEncrypted: encryptAssertion ?? encryptSamlAssertion,
       loginResponseTemplate: this.buildLoginResponseTemplate(),
       nameIDFormat: [nameIdFormat],
     });
@@ -459,6 +553,8 @@ export class SamlApplication {
         EntityID: this.sp.entityMeta.getEntityID(),
         SubjectRecipient: assertionConsumerServiceUrl,
         Issuer: this.idp.entityMeta.getEntityID(),
+        // The assertion template reuses this for `AuthnInstant`, which is the response time rather
+        // than the authentication time now that an existing session can be reused. See #9568.
         IssueInstant: now.toISOString(),
         AssertionConsumerServiceURL: assertionConsumerServiceUrl,
         StatusCode: saml.Constants.StatusCode.Success,
@@ -477,6 +573,48 @@ export class SamlApplication {
       };
 
       const context = saml.SamlLib.replaceTagsByValue(template, tagValues);
+
+      return {
+        id,
+        context,
+      };
+    };
+
+  /**
+   * Template callback for error status responses. Ignores the success template (which carries
+   * an assertion) and fills the assertion-less error template instead; the enclosing
+   * `createLoginResponse` still signs the response message like any other.
+   */
+  protected createSamlErrorTemplateCallback =
+    ({
+      statusCode,
+      samlRequestId,
+    }: {
+      statusCode: string;
+      samlRequestId: Nullable<string>;
+    }) =>
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    (_template: string) => {
+      const rawAssertionConsumerServiceUrl = this.sp.entityMeta.getAssertionConsumerService(
+        saml.Constants.wording.binding.post
+      );
+      const assertionConsumerServiceUrl = Array.isArray(rawAssertionConsumerServiceUrl)
+        ? (rawAssertionConsumerServiceUrl[0] ?? '')
+        : rawAssertionConsumerServiceUrl;
+
+      const id = `ID_${generateStandardId()}`;
+
+      const tagValues = {
+        ID: id,
+        IssueInstant: new Date().toISOString(),
+        Destination: assertionConsumerServiceUrl,
+        InResponseTo: samlRequestId ?? 'null',
+        Issuer: this.idp.entityMeta.getEntityID(),
+        StatusCode: saml.Constants.StatusCode.Responder,
+        SubStatusCode: statusCode,
+      };
+
+      const context = saml.SamlLib.replaceTagsByValue(samlErrorResponseTemplate, tagValues);
 
       return {
         id,

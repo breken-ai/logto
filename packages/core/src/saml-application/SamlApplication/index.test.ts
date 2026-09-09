@@ -11,6 +11,7 @@ const { jest } = import.meta;
 // Create a test class that exposes protected methods
 class TestSamlApplication extends SamlApplication {
   public exposedCreateSamlTemplateCallback = this.createSamlTemplateCallback;
+  public exposedCreateSamlErrorTemplateCallback = this.createSamlErrorTemplateCallback;
   public exposedExchangeAuthorizationCode = this.exchangeAuthorizationCode;
   public exposedGetUserInfo = this.getUserInfo;
   public exposedFetchOidcConfig = this.fetchOidcConfig;
@@ -344,6 +345,58 @@ describe('SamlApplication', () => {
       expect(scopes).toContain(UserScope.Phone);
       expect(scopes).toContain(UserScope.Roles);
       expect(scopes).toHaveLength(7);
+    });
+  });
+
+  describe('getSignInUrl', () => {
+    afterEach(() => {
+      nock.cleanAll();
+    });
+
+    it('should reuse the existing session by default (no prompt parameter)', async () => {
+      const url = await samlApp.getSignInUrl({ state: 'state-value' });
+
+      expect(`${url.origin}${url.pathname}`).toBe(mockAuthEndpoint);
+      expect(url.searchParams.get('client_id')).toBe(mockSamlApplicationId);
+      expect(url.searchParams.get('redirect_uri')).toBe(samlApp.config.redirectUri);
+      expect(url.searchParams.get('response_type')).toBe('code');
+      expect(url.searchParams.get('state')).toBe('state-value');
+      expect(url.searchParams.has('prompt')).toBe(false);
+    });
+
+    it('should force re-authentication when the service provider requested it', async () => {
+      const url = await samlApp.getSignInUrl({ state: 'state-value', forceAuthn: true });
+
+      expect(url.searchParams.get('prompt')).toBe('login');
+    });
+
+    it('should stay invisible for a passive request', async () => {
+      const url = await samlApp.getSignInUrl({ state: 'state-value', isPassive: true });
+
+      expect(url.searchParams.get('prompt')).toBe('none');
+    });
+
+    it('should reject a request that combines ForceAuthn and IsPassive', async () => {
+      await expect(
+        samlApp.getSignInUrl({ state: 'state-value', forceAuthn: true, isPassive: true })
+      ).rejects.toThrowError();
+    });
+  });
+
+  describe('createSamlErrorTemplateCallback', () => {
+    it('should build an assertion-less error status response', () => {
+      const callback = samlApp.exposedCreateSamlErrorTemplateCallback({
+        statusCode: 'urn:oasis:names:tc:SAML:2.0:status:NoPassive',
+        samlRequestId: '_request-id',
+      });
+      const { context } = callback('ignored-success-template');
+
+      expect(context).toContain('Value="urn:oasis:names:tc:SAML:2.0:status:Responder"');
+      expect(context).toContain('Value="urn:oasis:names:tc:SAML:2.0:status:NoPassive"');
+      expect(context).toContain('InResponseTo="_request-id"');
+      expect(context).toContain('Destination="https://sp.example.com/acs"');
+      expect(context).toContain('<saml:Issuer>');
+      expect(context).not.toContain('<saml:Assertion');
     });
   });
 

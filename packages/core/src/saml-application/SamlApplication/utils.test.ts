@@ -1,6 +1,12 @@
 import { NameIdFormat } from '@logto/schemas';
 
-import { generateAutoSubmitForm, buildSamlAssertionNameId } from './utils.js';
+import {
+  generateAutoSubmitForm,
+  buildSamlAssertionNameId,
+  isForceAuthnRequested,
+  isPassiveRequested,
+  extractAuthnRequestSubjectNameId,
+} from './utils.js';
 
 describe('buildSamlAssertionNameId', () => {
   it('should use email when email_verified is true', () => {
@@ -182,5 +188,72 @@ describe('generateAutoSubmitForm', () => {
     expect(() =>
       generateAutoSubmitForm('https://example.com/acs', samlResponse)
     ).not.toThrowError();
+  });
+});
+
+const buildAuthnRequest = (extraAttributes = '') =>
+  `<samlp:AuthnRequest xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_request-id" Version="2.0" IssueInstant="2025-01-01T00:00:00Z" AssertionConsumerServiceURL="https://sp.example.com/acs"${extraAttributes}><saml:Issuer>https://sp.example.com</saml:Issuer></samlp:AuthnRequest>`;
+
+describe('isForceAuthnRequested', () => {
+  it('should be false when the request does not carry ForceAuthn', () => {
+    expect(isForceAuthnRequested(buildAuthnRequest())).toBe(false);
+  });
+
+  it('should be true when ForceAuthn is "true"', () => {
+    expect(isForceAuthnRequested(buildAuthnRequest(' ForceAuthn="true"'))).toBe(true);
+  });
+
+  it('should be true when ForceAuthn is "1"', () => {
+    expect(isForceAuthnRequested(buildAuthnRequest(' ForceAuthn="1"'))).toBe(true);
+  });
+
+  it('should be false when ForceAuthn is "false"', () => {
+    expect(isForceAuthnRequested(buildAuthnRequest(' ForceAuthn="false"'))).toBe(false);
+  });
+
+  it('should collapse surrounding whitespace', () => {
+    expect(isForceAuthnRequested(buildAuthnRequest(' ForceAuthn=" true "'))).toBe(true);
+  });
+});
+
+describe('isPassiveRequested', () => {
+  it('should be false when the request does not carry IsPassive', () => {
+    expect(isPassiveRequested(buildAuthnRequest())).toBe(false);
+  });
+
+  it('should be true when IsPassive is "true"', () => {
+    expect(isPassiveRequested(buildAuthnRequest(' IsPassive="true"'))).toBe(true);
+  });
+
+  it('should be true when IsPassive is "1"', () => {
+    expect(isPassiveRequested(buildAuthnRequest(' IsPassive="1"'))).toBe(true);
+  });
+
+  it('should be false when IsPassive is "false"', () => {
+    expect(isPassiveRequested(buildAuthnRequest(' IsPassive="false"'))).toBe(false);
+  });
+});
+
+describe('extractAuthnRequestSubjectNameId', () => {
+  it('should return undefined when the request carries no Subject', () => {
+    expect(extractAuthnRequestSubjectNameId(buildAuthnRequest())).toBeUndefined();
+  });
+
+  it('should read the Subject NameID value when present', () => {
+    const request = buildAuthnRequest().replace(
+      '</samlp:AuthnRequest>',
+      '<saml:Subject><saml:NameID Format="urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress">jane@example.com</saml:NameID></saml:Subject></samlp:AuthnRequest>'
+    );
+
+    expect(extractAuthnRequestSubjectNameId(request)).toBe('jane@example.com');
+  });
+
+  it('should return undefined for an empty Subject NameID', () => {
+    const request = buildAuthnRequest().replace(
+      '</samlp:AuthnRequest>',
+      '<saml:Subject><saml:NameID></saml:NameID></saml:Subject></samlp:AuthnRequest>'
+    );
+
+    expect(extractAuthnRequestSubjectNameId(request)).toBeUndefined();
   });
 });

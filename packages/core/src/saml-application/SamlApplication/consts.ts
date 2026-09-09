@@ -28,6 +28,28 @@ export const samlLogInResponseTemplate = `
   </saml:Assertion>
 </samlp:Response>`;
 
+/**
+ * Template for SAML error status responses, which carry no assertion (SAML 2.0 core,
+ * section 3.2.2). Used when the service provider's request cannot be honored, e.g. an
+ * `IsPassive` request with no active session (`NoPassive`) or a pinned `Subject` that
+ * does not match the authenticated user (`UnknownPrincipal`).
+ */
+export const samlErrorResponseTemplate = `
+<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="{ID}" Version="2.0" IssueInstant="{IssueInstant}" Destination="{Destination}" InResponseTo="{InResponseTo}">
+  <saml:Issuer>{Issuer}</saml:Issuer>
+  <samlp:Status>
+    <samlp:StatusCode Value="{StatusCode}">
+      <samlp:StatusCode Value="{SubStatusCode}"/>
+    </samlp:StatusCode>
+  </samlp:Status>
+</samlp:Response>`;
+
+/** SAML 2.0 status codes used by Logto-issued responses (top-level codes via samlify constants). */
+export const samlStatusCode = {
+  noPassive: 'urn:oasis:names:tc:SAML:2.0:status:NoPassive',
+  unknownPrincipal: 'urn:oasis:names:tc:SAML:2.0:status:UnknownPrincipal',
+} as const;
+
 export const samlAttributeNameFormatBasic = 'urn:oasis:names:tc:SAML:2.0:attrname-format:basic';
 
 const samlValueXmlnsXsiString = 'xs:string';

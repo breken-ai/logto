@@ -1,7 +1,8 @@
 import { NameIdFormat } from '@logto/schemas';
 import { generateStandardId } from '@logto/shared';
-import { appendPath } from '@silverhand/essentials';
+import { appendPath, type Optional } from '@silverhand/essentials';
 import camelCase from 'camelcase';
+import saml from 'samlify';
 
 import RequestError from '#src/errors/RequestError/index.js';
 import { type IdTokenProfileStandardClaims } from '#src/sso/types/oidc.js';
@@ -118,4 +119,54 @@ export const getSamlAppCallbackUrl = (baseUrl: URL, samlAppId: string) =>
 export const generateSamlAttributeTag = (content: string, prefix = 'attr'): string => {
   const camelContent = camelCase(content, { locale: 'en-us' });
   return prefix + camelContent.charAt(0).toUpperCase() + camelContent.slice(1);
+};
+
+/**
+ * Whether the service provider asked to re-authenticate the user, i.e. its `AuthnRequest` carries
+ * `ForceAuthn="true"` (SAML 2.0 core, section 3.4.1; `xs:boolean` also admits `1`).
+ *
+ * samlify's default login-request extractor does not read this attribute, so it is read from the
+ * decoded request XML.
+ */
+export const isForceAuthnRequested = (authnRequestXml: string): boolean => {
+  const { forceAuthn } = saml.Extractor.extract(authnRequestXml, [
+    { key: 'forceAuthn', localPath: ['AuthnRequest'], attributes: ['ForceAuthn'] },
+  ]);
+
+  // `xs:boolean` fixes the `whiteSpace` facet to `collapse`, so a padded value is still valid.
+  const value = typeof forceAuthn === 'string' ? forceAuthn.trim() : undefined;
+
+  return value === 'true' || value === '1';
+};
+
+/**
+ * Whether the service provider asked the identity provider to stay invisible, i.e. its
+ * `AuthnRequest` carries `IsPassive="true"` (SAML 2.0 core, section 3.4.1; `xs:boolean` also
+ * admits `1`). The OIDC equivalent is `prompt=none`; if no session exists, the correct failure
+ * mode is a `NoPassive` status response, not a sign-in page.
+ *
+ * Like `ForceAuthn`, samlify's default login-request extractor omits this attribute, so it is
+ * read from the decoded request XML.
+ */
+export const isPassiveRequested = (authnRequestXml: string): boolean => {
+  const { isPassive } = saml.Extractor.extract(authnRequestXml, [
+    { key: 'isPassive', localPath: ['AuthnRequest'], attributes: ['IsPassive'] },
+  ]);
+
+  const value = typeof isPassive === 'string' ? isPassive.trim() : undefined;
+
+  return value === 'true' || value === '1';
+};
+
+/**
+ * Extract the `<saml:Subject><saml:NameID>` value from an `AuthnRequest`, when the service
+ * provider pinned the subject it expects the assertion for (SAML 2.0 core, section 3.4.1).
+ * Returns `undefined` when the request does not constrain the subject.
+ */
+export const extractAuthnRequestSubjectNameId = (authnRequestXml: string): Optional<string> => {
+  const { subjectNameId } = saml.Extractor.extract(authnRequestXml, [
+    { key: 'subjectNameId', localPath: ['AuthnRequest', 'Subject', 'NameID'], attributes: [] },
+  ]);
+
+  return typeof subjectNameId === 'string' && subjectNameId !== '' ? subjectNameId : undefined;
 };

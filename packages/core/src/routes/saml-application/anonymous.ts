@@ -2,7 +2,7 @@
 // TODO: refactor this file to reduce LOC
 import { authRequestInfoGuard, SamlApplicationSessions } from '@logto/schemas';
 import { generateStandardId, generateStandardShortId } from '@logto/shared';
-import { cond, removeUndefinedKeys, trySafe } from '@silverhand/essentials';
+import { cond, conditional, removeUndefinedKeys, trySafe } from '@silverhand/essentials';
 import { addMinutes } from 'date-fns';
 import { z } from 'zod';
 
@@ -12,11 +12,18 @@ import koaAuditLog from '#src/middleware/koa-audit-log.js';
 import koaGuard from '#src/middleware/koa-guard.js';
 import type { AnonymousRouter, RouterInitArgs } from '#src/routes/types.js';
 import { SamlApplication } from '#src/saml-application/SamlApplication/index.js';
-import { generateAutoSubmitForm } from '#src/saml-application/SamlApplication/utils.js';
+import { samlStatusCode } from '#src/saml-application/SamlApplication/consts.js';
+import {
+  buildSamlAssertionNameId,
+  generateAutoSubmitForm,
+  isForceAuthnRequested,
+  isPassiveRequested,
+  extractAuthnRequestSubjectNameId,
+} from '#src/saml-application/SamlApplication/utils.js';
 import assertThat from '#src/utils/assert-that.js';
 import { getConsoleLogFromContext } from '#src/utils/console.js';
 
-import { verifyAndGetSamlSessionData } from './utils.js';
+import { decodeAuthnRequestXml, verifyAndGetSamlSessionData } from './utils.js';
 
 const samlApplicationSignInCallbackQueryParametersGuard = z
   .object({
@@ -99,16 +106,66 @@ export default function samlApplicationAnonymousRoutes<T extends AnonymousRouter
       }
 
       // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
-      if (query.error && (query.code || query.state || query.redirectUri)) {
+      if (query.error && (query.code || query.redirectUri)) {
         throw new RequestError({
           code: 'guard.invalid_input',
           type: 'query',
-          message: 'When error is present, only error_description is allowed',
+          message: 'When error is present, only state and error_description are allowed',
         });
       }
 
       // Handle error in query parameters
       if (query.error) {
+        /**
+         * An `IsPassive` SAML request maps to `prompt=none` on the OIDC authorization request,
+         * so when no session exists the provider redirects back with `login_required` (or
+         * `interaction_required`) instead of showing a sign-in page. Translate that into the
+         * SAML failure mode: a `NoPassive` status response POSTed to the service provider
+         * (SAML 2.0 core, section 3.4.1). Fall back to the plain error when the request cannot
+         * be tied back to a SAML session.
+         */
+        if (query.error === 'login_required' || query.error === 'interaction_required') {
+          const noPassiveForm = await trySafe(
+            async () => {
+              assertThat(
+                query.state,
+                new RequestError({
+                  code: 'guard.invalid_input',
+                  type: 'query',
+                  message: '`state` is required.',
+                })
+              );
+
+              const details = await getSamlApplicationDetailsById(id);
+              const samlApplication = new SamlApplication(details, id, envSet);
+              const { relayState, samlRequestId } = await verifyAndGetSamlSessionData(
+                ctx,
+                queries.samlApplicationSessions,
+                query.state
+              );
+
+              const {
+                context,
+                entityEndpoint,
+                relayState: returnedRelayState,
+              } = await samlApplication.createSamlErrorResponse({
+                statusCode: samlStatusCode.noPassive,
+                relayState,
+                samlRequestId,
+              });
+
+              return generateAutoSubmitForm(entityEndpoint, context, returnedRelayState);
+            },
+            () => undefined
+          );
+
+          if (noPassiveForm) {
+            ctx.body = noPassiveForm;
+
+            return next();
+          }
+        }
+
         throw new RequestError({
           code: 'oidc.invalid_request',
           message: query.error_description,
@@ -147,7 +204,7 @@ export default function samlApplicationAnonymousRoutes<T extends AnonymousRouter
         assertThat(redirectUri === samlApplication.samlAppCallbackUrl, 'oidc.invalid_redirect_uri');
       }
 
-      const { relayState, samlRequestId, sessionId, sessionExpiresAt } =
+      const { relayState, samlRequestId, rawAuthRequest, sessionId, sessionExpiresAt } =
         await verifyAndGetSamlSessionData(ctx, queries.samlApplicationSessions, state);
       log.append({
         session: {
@@ -165,6 +222,40 @@ export default function samlApplicationAnonymousRoutes<T extends AnonymousRouter
       log.append({
         userInfo,
       });
+
+      /**
+       * When the service provider pinned a `<saml:Subject>` on its `AuthnRequest`, the
+       * assertion must name that principal (SAML 2.0 core, section 3.4.1). Compare against
+       * the NameID that would be asserted for the signed-in user; on mismatch, return an
+       * `UnknownPrincipal` status response instead of silently asserting a different user.
+       */
+      const pinnedSubjectNameId = conditional(
+        rawAuthRequest && extractAuthnRequestSubjectNameId(decodeAuthnRequestXml(rawAuthRequest))
+      );
+
+      if (pinnedSubjectNameId) {
+        const { NameID: sessionNameId } = buildSamlAssertionNameId(userInfo, [
+          samlApplication.config.nameIdFormat,
+        ]);
+
+        if (sessionNameId !== pinnedSubjectNameId) {
+          log.append({ samlSubjectMismatch: { pinnedSubjectNameId } });
+
+          const {
+            context,
+            entityEndpoint,
+            relayState: returnedRelayState,
+          } = await samlApplication.createSamlErrorResponse({
+            statusCode: samlStatusCode.unknownPrincipal,
+            relayState,
+            samlRequestId,
+          });
+
+          ctx.body = generateAutoSubmitForm(entityEndpoint, context, returnedRelayState);
+
+          return next();
+        }
+      }
 
       const {
         context,
@@ -287,9 +378,15 @@ export default function samlApplicationAnonymousRoutes<T extends AnonymousRouter
         'application.saml.auth_request_issuer_not_match'
       );
 
+      const forceAuthn = isForceAuthnRequested(loginRequestResult.samlContent);
+      const isPassive = isPassiveRequested(loginRequestResult.samlContent);
+      log.append({ forceAuthn, isPassive });
+
       const state = generateStandardId(32);
       const signInUrl = await samlApplication.getSignInUrl({
         state,
+        forceAuthn,
+        isPassive,
       });
       log.append({ signInUrl: signInUrl.toString() });
 
@@ -381,9 +478,15 @@ export default function samlApplicationAnonymousRoutes<T extends AnonymousRouter
         'application.saml.auth_request_issuer_not_match'
       );
 
+      const forceAuthn = isForceAuthnRequested(loginRequestResult.samlContent);
+      const isPassive = isPassiveRequested(loginRequestResult.samlContent);
+      log.append({ forceAuthn, isPassive });
+
       const state = generateStandardShortId();
       const signInUrl = await samlApplication.getSignInUrl({
         state,
+        forceAuthn,
+        isPassive,
       });
       log.append({ signInUrl: signInUrl.toString() });
 
